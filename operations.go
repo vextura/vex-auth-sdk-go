@@ -315,6 +315,13 @@ func (c *Client) GetSession(ctx context.Context, in SessionIdInput) (SessionDeta
 }
 
 // IssueToken calls POST /auth/token.
+//
+// NOTE: this is the JSON path retained for callers that speak the Vextura
+// internal wire shape. OAuth2 spec-compliant clients should prefer
+// IssueTokenForm (application/x-www-form-urlencoded per RFC 6749 §3.2).
+// Both methods route errors through decodeOAuth2ErrorOrFallback so callers
+// see actionable OAuth2 error text ({error, error_description}) regardless
+// of which envelope the server chose to emit.
 func (c *Client) IssueToken(ctx context.Context, in TokenRequest) (TokenResponse, error) {
 	var zero TokenResponse
 	path := "/auth/token"
@@ -343,7 +350,7 @@ func (c *Client) IssueToken(ctx context.Context, in TokenRequest) (TokenResponse
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return zero, decodeError(resp)
+		return zero, decodeOAuth2ErrorOrFallback(resp)
 	}
 	if resp.StatusCode == http.StatusNoContent {
 		return zero, nil
