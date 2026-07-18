@@ -1,15 +1,21 @@
 // Package auth: OAuth2 wire-shape helpers.
 //
 // This file is HAND-WRITTEN (unlike client.go / types.go / operations.go /
-// errors.go / doc.go which are generated). It adds two things codegen does
-// not yet emit:
+// errors.go / doc.go which are generated). It adds three things codegen
+// does not yet emit:
 //
 //  1. IssueTokenForm — POSTs application/x-www-form-urlencoded per RFC 6749
 //     §3.2. vex-auth's token endpoint accepts both JSON (Vextura-internal
 //     shape) and form-encoded (OAuth2 spec). Downstream OAuth2 clients
 //     (vexctl refresh, vex-mcp-server auth) MUST use form-encoding to match
 //     the spec and to keep vex-auth's r.ParseForm() path happy.
-//  2. OAuth2Error / decodeOAuth2ErrorOrFallback — RFC 6749 §5.2 error shape
+//  2. RevokeTokenForm + RevokeRequest — POSTs application/x-www-form-
+//     urlencoded to /auth/revoke per RFC 7009 §2.1. Same rationale as
+//     IssueTokenForm: form is the spec-mandated wire shape and vex-auth's
+//     HandleRevoke reads r.FormValue("token"). Includes the RFC 7009 §2.2
+//     no-info-leak semantics — 200 on unknown-token returns nil, never a
+//     "not found" error.
+//  3. OAuth2Error / decodeOAuth2ErrorOrFallback — RFC 6749 §5.2 error shape
 //     ({error, error_description, error_uri}). The generated ErrorEnvelope
 //     decoder only understands {code, message}, so actionable OAuth2 error
 //     text is lost when vex-auth answers with the spec envelope.
@@ -217,6 +223,96 @@ func (c *Client) IssueTokenForm(ctx context.Context, in TokenRequest) (TokenResp
 		return zero, fmt.Errorf("IssueTokenForm: decode response: %w", err)
 	}
 	return out, nil
+}
+
+// RevokeRequest is the RFC 7009 §2.1 token revocation request.
+//
+// Unlike RevokeTokenRequest (the codegen struct which mirrors the internal
+// Smithy shape), this type carries the optional client-authentication fields
+// clients need when calling /auth/revoke as a public OAuth2 client. It stays
+// hand-written for the same reason IssueTokenForm's inputs do — codegen
+// does not yet emit the RFC 6749/7009 form-encoded shape.
+type RevokeRequest struct {
+	// Token is the credential to revoke. Required. Either an access token
+	// or a refresh token — the server determines the type from the value
+	// itself (with the optional TokenTypeHint helping short-circuit the
+	// lookup per RFC 7009 §2.1).
+	Token string
+	// TokenTypeHint is one of "access_token" or "refresh_token" per RFC
+	// 7009 §2.1. Optional; the server MUST still process the request when
+	// the hint is missing or wrong. Empty means "no hint".
+	TokenTypeHint string
+	// ClientID identifies the OAuth2 client (RFC 6749 §2.3.1). Optional
+	// when the client is already authenticated at the transport layer
+	// (e.g. via Bearer on the SDK). Send it when acting as a public
+	// client that has no other credentials.
+	ClientID string
+	// ClientSecret authenticates the client for confidential clients
+	// (RFC 6749 §2.3.1). Optional. Empty for public clients.
+	ClientSecret string
+}
+
+// RevokeTokenForm posts application/x-www-form-urlencoded to /auth/revoke
+// per RFC 7009 §2.1. Prefer this over RevokeToken for any OAuth2 grant
+// flow client (vexctl logout, vex-mcp-server auth-revoke, etc.) — it
+// matches the spec wire shape every RFC 7009 server expects and unlocks
+// the RFC 6749 §5.2 error decoder on failure.
+//
+// The JSON path (RevokeToken) is retained for backwards compatibility with
+// callers on the internal Vextura envelope. Both target the same endpoint.
+//
+// Semantics (per RFC 7009 §2.2):
+//   - 200 is returned whether the token was known or unknown. The server
+//     MUST NOT distinguish, so this method returns nil in both cases.
+//     Callers cannot use RevokeTokenForm to probe token validity.
+//   - 400 invalid_request / 401 invalid_client → *OAuth2Error.
+//   - 503 unsupported_token_type → *OAuth2Error per §2.2.1.
+//
+// Encoding rules mirror IssueTokenForm: empty fields are omitted so the
+// server sees "missing" rather than "blank".
+func (c *Client) RevokeTokenForm(ctx context.Context, in RevokeRequest) error {
+	// Local validation — RFC 7009 §2.1 mandates the token parameter;
+	// short-circuiting here avoids a pointless round-trip and gives the
+	// caller an immediately-typed OAuth2Error rather than a server 400.
+	if in.Token == "" {
+		return &OAuth2Error{Code: "invalid_request", Description: "token is required"}
+	}
+
+	form := url.Values{}
+	form.Set("token", in.Token)
+	if in.TokenTypeHint != "" {
+		form.Set("token_type_hint", in.TokenTypeHint)
+	}
+	if in.ClientID != "" {
+		form.Set("client_id", in.ClientID)
+	}
+	if in.ClientSecret != "" {
+		form.Set("client_secret", in.ClientSecret)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint+"/auth/revoke", strings.NewReader(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("RevokeTokenForm: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("RevokeTokenForm: http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// RFC 7009 §2.2: server MUST return 200 regardless of whether the token
+	// was known. Do NOT branch on body content here — silently succeeding
+	// on unknown-token is the spec-mandated behavior (no info leak).
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	return decodeOAuth2ErrorOrFallback(resp)
 }
 
 // filterEmpty drops empty strings from s without allocating when there are

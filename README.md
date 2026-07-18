@@ -37,6 +37,32 @@ if oe, ok := auth.IsOAuth2Error(err); ok && oe.Code == "invalid_grant" {
 `IssueToken` (JSON) is retained for callers that need the Vextura internal
 envelope; both methods surface OAuth2 error text when the server emits it.
 
+## OAuth2 token revocation
+
+For RFC 7009 revocation (logout, session invalidation, admin-triggered
+cleanup) prefer `RevokeTokenForm` — it POSTs `application/x-www-form-
+urlencoded` per RFC 7009 §2.1 and honours the §2.2 no-info-leak semantics
+(returns `nil` whether the server knew the token or not).
+
+```go
+err := client.RevokeTokenForm(ctx, auth.RevokeRequest{
+    Token:         refreshToken,
+    TokenTypeHint: "refresh_token", // optional — helps server skip a lookup
+    ClientID:      "vexctl-cli",    // optional — for public clients
+})
+if oe, ok := auth.IsOAuth2Error(err); ok && oe.Code == "invalid_client" {
+    // client credentials rejected — surface to user
+}
+```
+
+Because RFC 7009 forbids leaking token-existence, a nil return does not
+prove the token was live before the call. Do not use `RevokeTokenForm` as
+a validity check — use `IssueTokenForm` with `grant_type=refresh_token`
+and inspect the OAuth2 error for that purpose.
+
+`RevokeToken` (JSON) is retained for callers on the Vextura internal
+envelope; new integrations should use `RevokeTokenForm`.
+
 ## Generated
 
 Most files (`client.go`, `types.go`, `operations.go`, `errors.go`, `doc.go`)

@@ -432,6 +432,307 @@ func TestIssueToken_JSONPath_Success(t *testing.T) {
 	}
 }
 
+// -------- RevokeTokenForm: encoding + no-info-leak semantics --------
+
+// Happy path: server accepts a known token and returns 200 with an empty
+// body. Method must return nil. Form body and headers must match RFC 7009.
+func TestRevokeTokenForm_KnownToken200(t *testing.T) {
+	t.Parallel()
+
+	var gotForm url.Values
+	var gotCT, gotAccept, gotAuth, gotPath, gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		gotCT = r.Header.Get("Content-Type")
+		gotAccept = r.Header.Get("Accept")
+		gotAuth = r.Header.Get("Authorization")
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm: %v", err)
+		}
+		gotForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "adminBearer")
+	err := c.RevokeTokenForm(context.Background(), RevokeRequest{
+		Token:         "rt-xyz",
+		TokenTypeHint: "refresh_token",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotPath != "/auth/revoke" {
+		t.Errorf("path=%q, want /auth/revoke", gotPath)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method=%q, want POST", gotMethod)
+	}
+	if gotCT != "application/x-www-form-urlencoded" {
+		t.Errorf("Content-Type=%q, want application/x-www-form-urlencoded", gotCT)
+	}
+	if gotAccept != "application/json" {
+		t.Errorf("Accept=%q, want application/json", gotAccept)
+	}
+	if gotAuth != "Bearer adminBearer" {
+		t.Errorf("Authorization=%q, want Bearer adminBearer", gotAuth)
+	}
+	if gotForm.Get("token") != "rt-xyz" {
+		t.Errorf("token=%q, want rt-xyz", gotForm.Get("token"))
+	}
+	if gotForm.Get("token_type_hint") != "refresh_token" {
+		t.Errorf("token_type_hint=%q, want refresh_token", gotForm.Get("token_type_hint"))
+	}
+}
+
+// RFC 7009 §2.2: server MUST return 200 for both known and unknown tokens.
+// The SDK MUST NOT distinguish either — no error on unknown token. This is
+// the load-bearing security property (no token-existence leak).
+func TestRevokeTokenForm_UnknownToken200NoInfoLeak(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate vex-auth's "unknown token" branch: still 200, empty body.
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.RevokeTokenForm(context.Background(), RevokeRequest{
+		Token: "garbage-never-issued",
+	})
+	if err != nil {
+		t.Errorf("RFC 7009 §2.2 violation: unknown-token must return nil, got %v", err)
+	}
+}
+
+// 204 No Content is also a legal success — some gate proxies rewrite 200
+// with empty body to 204. Accept both, still nil.
+func TestRevokeTokenForm_204Success(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	if err := c.RevokeTokenForm(context.Background(), RevokeRequest{Token: "rt"}); err != nil {
+		t.Errorf("204 should be treated as success, got %v", err)
+	}
+}
+
+// Missing token → local invalid_request error BEFORE any HTTP call.
+// Verifies we don't waste a round-trip and that the caller can pattern-match
+// the OAuth2Error identically whether the check is client- or server-side.
+func TestRevokeTokenForm_MissingTokenLocalError(t *testing.T) {
+	t.Parallel()
+
+	var called bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.RevokeTokenForm(context.Background(), RevokeRequest{})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	oe, ok := IsOAuth2Error(err)
+	if !ok {
+		t.Fatalf("want *OAuth2Error, got %v (%T)", err, err)
+	}
+	if oe.Code != "invalid_request" {
+		t.Errorf("Code=%q, want invalid_request", oe.Code)
+	}
+	if called {
+		t.Errorf("local validation must short-circuit before HTTP call")
+	}
+}
+
+// 401 invalid_client → decoded as *OAuth2Error with the RFC 6749 §5.2 code.
+// Exercises the shared error decoder path for the revoke endpoint.
+func TestRevokeTokenForm_InvalidClient(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"invalid_client","error_description":"unknown client"}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.RevokeTokenForm(context.Background(), RevokeRequest{Token: "rt"})
+	if err == nil {
+		t.Fatal("want error")
+	}
+	oe, ok := IsOAuth2Error(err)
+	if !ok {
+		t.Fatalf("want *OAuth2Error, got %v (%T)", err, err)
+	}
+	if oe.Code != "invalid_client" {
+		t.Errorf("Code=%q, want invalid_client", oe.Code)
+	}
+	if oe.HTTPStatus != http.StatusUnauthorized {
+		t.Errorf("HTTPStatus=%d, want 401", oe.HTTPStatus)
+	}
+}
+
+// 400 unsupported_token_type per RFC 7009 §2.2.1 — this is the one error
+// code specific to /revoke (as opposed to /token). Confirms the decoder
+// surfaces revocation-specific errors just like grant errors.
+func TestRevokeTokenForm_UnsupportedTokenType(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"unsupported_token_type","error_description":"server does not support this token type"}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.RevokeTokenForm(context.Background(), RevokeRequest{
+		Token:         "rt",
+		TokenTypeHint: "phantom_token",
+	})
+	oe, ok := IsOAuth2Error(err)
+	if !ok {
+		t.Fatalf("want *OAuth2Error, got %v (%T)", err, err)
+	}
+	if oe.Code != "unsupported_token_type" {
+		t.Errorf("Code=%q, want unsupported_token_type", oe.Code)
+	}
+}
+
+// ClientID + ClientSecret round-trip verifies public-client authentication
+// flows: vex-mcp-server and vexctl talk to /auth/revoke without a Bearer,
+// only a client_id (and optionally client_secret) in the form.
+func TestRevokeTokenForm_ClientCredsPassthrough(t *testing.T) {
+	t.Parallel()
+	var gotForm url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		gotForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "") // no Bearer — public client
+	err := c.RevokeTokenForm(context.Background(), RevokeRequest{
+		Token:        "rt",
+		ClientID:     "vexctl-cli",
+		ClientSecret: "s3cret",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotForm.Get("client_id") != "vexctl-cli" {
+		t.Errorf("client_id=%q, want vexctl-cli", gotForm.Get("client_id"))
+	}
+	if gotForm.Get("client_secret") != "s3cret" {
+		t.Errorf("client_secret=%q, want s3cret", gotForm.Get("client_secret"))
+	}
+}
+
+// Empty optional fields must be OMITTED, not sent blank. Same rationale as
+// IssueTokenForm — a server-side validation that rejects blank client_id
+// is more useful than one that silently accepts it as authentic-but-empty.
+func TestRevokeTokenForm_OmitsEmptyFields(t *testing.T) {
+	t.Parallel()
+	var gotForm url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		gotForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.RevokeTokenForm(context.Background(), RevokeRequest{Token: "rt-only"})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if len(gotForm) != 1 {
+		t.Errorf("want only 'token' field, got %d keys (%v)", len(gotForm), keys(gotForm))
+	}
+	if gotForm.Get("token") != "rt-only" {
+		t.Errorf("token=%q, want rt-only", gotForm.Get("token"))
+	}
+	for _, absent := range []string{"token_type_hint", "client_id", "client_secret"} {
+		if _, present := gotForm[absent]; present {
+			t.Errorf("%s must be omitted when empty, got form=%v", absent, gotForm)
+		}
+	}
+}
+
+// Verify the raw form body wire shape (not just parsed values). RFC 7009
+// §2.1 shows `token=45ghiukldjahdnhzdauz&token_type_hint=refresh_token`
+// — confirm we emit percent-encoded pairs joined by '&'.
+func TestRevokeTokenForm_RawWireFormat(t *testing.T) {
+	t.Parallel()
+	var rawBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		rawBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.RevokeTokenForm(context.Background(), RevokeRequest{
+		Token:         "abc123",
+		TokenTypeHint: "refresh_token",
+	})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	// Both key-value pairs must be present, joined by '&'.
+	if !strings.Contains(rawBody, "token=abc123") {
+		t.Errorf("body missing token pair: %q", rawBody)
+	}
+	if !strings.Contains(rawBody, "token_type_hint=refresh_token") {
+		t.Errorf("body missing token_type_hint pair: %q", rawBody)
+	}
+	if !strings.Contains(rawBody, "&") {
+		t.Errorf("body missing '&' separator: %q", rawBody)
+	}
+}
+
+// Regression tripwire: the JSON RevokeToken path (from v0.2.0, generated
+// in operations.go) MUST keep its current signature and JSON body shape.
+// This test guards against an accidental codegen re-run that changes the
+// RevokeToken wire format and silently breaks legacy callers who chose the
+// JSON path deliberately (RevokeTokenForm is additive).
+func TestRevokeToken_JSONPath_UnchangedWireShape(t *testing.T) {
+	t.Parallel()
+	var gotCT, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCT = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.RevokeToken(context.Background(), RevokeTokenRequest{
+		Token:         "rt",
+		TokenTypeHint: "refresh_token",
+	})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if gotCT != "application/json" {
+		t.Errorf("RevokeToken must remain JSON path, got Content-Type=%q", gotCT)
+	}
+	if !strings.Contains(gotBody, `"token":"rt"`) {
+		t.Errorf("RevokeToken JSON body malformed: %s", gotBody)
+	}
+}
+
 // -------- helpers --------
 
 func keys(m url.Values) []string {
