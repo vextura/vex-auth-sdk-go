@@ -512,3 +512,85 @@ func (c *Client) RefreshSession(ctx context.Context, in RefreshInput) (LoginOutp
 	}
 	return out, nil
 }
+
+// RevokeToken calls POST /auth/revoke.
+func (c *Client) RevokeToken(ctx context.Context, in RevokeTokenRequest) (RevokeTokenResponse, error) {
+	var zero RevokeTokenResponse
+	path := "/auth/revoke"
+	u := c.endpoint + path
+
+	var bodyReader io.Reader
+	body, err := json.Marshal(in)
+	if err != nil {
+		return zero, fmt.Errorf("RevokeToken: marshal body: %w", err)
+	}
+	bodyReader = bytes.NewReader(body)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bodyReader)
+	if err != nil {
+		return zero, fmt.Errorf("RevokeToken: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return zero, fmt.Errorf("RevokeToken: http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return zero, decodeError(resp)
+	}
+	if resp.StatusCode == http.StatusNoContent {
+		return zero, nil
+	}
+	var out RevokeTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return zero, fmt.Errorf("RevokeToken: decode response: %w", err)
+	}
+	return out, nil
+}
+
+// SignUp calls POST /auth/signup.
+func (c *Client) SignUp(ctx context.Context, in SignUpInput) (SignUpOutput, error) {
+	var zero SignUpOutput
+	path := "/auth/signup"
+	u := c.endpoint + path
+
+	var bodyReader io.Reader
+	body, err := json.Marshal(in)
+	if err != nil {
+		return zero, fmt.Errorf("SignUp: marshal body: %w", err)
+	}
+	bodyReader = bytes.NewReader(body)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bodyReader)
+	if err != nil {
+		return zero, fmt.Errorf("SignUp: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return zero, fmt.Errorf("SignUp: http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return zero, decodeError(resp)
+	}
+	if resp.StatusCode == http.StatusNoContent {
+		return zero, nil
+	}
+	var out SignUpOutput
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return zero, fmt.Errorf("SignUp: decode response: %w", err)
+	}
+	return out, nil
+}

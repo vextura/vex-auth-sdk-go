@@ -118,6 +118,16 @@ type RefreshInput struct {
 	SessionId string `json:"session_id"`
 }
 
+// RevokeTokenRequest mirrors the Smithy structure of the same name.
+type RevokeTokenRequest struct {
+	Token         string `json:"token"`
+	TokenTypeHint string `json:"token_type_hint,omitempty"`
+}
+
+// RevokeTokenResponse mirrors the Smithy structure of the same name.
+type RevokeTokenResponse struct {
+}
+
 // ServiceAccount mirrors the Smithy structure of the same name.
 type ServiceAccount struct {
 	ClientId    string   `json:"client_id"`
@@ -161,19 +171,45 @@ type SessionIdInput struct {
 	SessionId string `json:"session_id"`
 }
 
+// SignUpInput mirrors the Smithy structure of the same name.
+type SignUpInput struct {
+	CompanyName string `json:"company_name"`
+	Tenant      string `json:"tenant"`
+	Username    string `json:"username"`
+	Email       string `json:"email"`
+	Password    string `json:"password"`
+	DisplayName string `json:"display_name,omitempty"`
+}
+
+// SignUpOutput mirrors the Smithy structure of the same name.
+type SignUpOutput struct {
+	Tenant           string   `json:"tenant"`
+	Username         string   `json:"username"`
+	AccessToken      string   `json:"access_token"`
+	TokenType        string   `json:"token_type"`
+	ExpiresIn        int      `json:"expires_in"`
+	ProvisionedRoles []string `json:"provisioned_roles"`
+	RootRole         string   `json:"root_role"`
+}
+
 // TokenRequest mirrors the Smithy structure of the same name.
 type TokenRequest struct {
 	GrantType    string   `json:"grant_type"`
-	ClientId     string   `json:"client_id"`
-	ClientSecret string   `json:"client_secret"`
+	ClientId     string   `json:"client_id,omitempty"`
+	ClientSecret string   `json:"client_secret,omitempty"`
+	Username     string   `json:"username,omitempty"`
+	Password     string   `json:"password,omitempty"`
+	RefreshToken string   `json:"refresh_token,omitempty"`
 	Tenant       string   `json:"tenant,omitempty"`
 	Scope        []string `json:"scope,omitempty"`
 }
 
 // TokenResponse mirrors the Smithy structure of the same name.
 type TokenResponse struct {
-	AccessToken string   `json:"access_token"`
-	TokenType   string   `json:"token_type"`
-	ExpiresIn   int      `json:"expires_in"`
-	Scope       []string `json:"scope,omitempty"`
+	AccessToken           string   `json:"access_token"`
+	TokenType             string   `json:"token_type"`
+	ExpiresIn             int      `json:"expires_in"`
+	RefreshToken          string   `json:"refresh_token,omitempty"`
+	RefreshTokenExpiresIn int      `json:"refresh_token_expires_in,omitempty"`
+	Scope                 []string `json:"scope,omitempty"`
 }
